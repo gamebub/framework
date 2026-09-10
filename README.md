@@ -1,4 +1,6 @@
-# Game Bub Framework
+# Game Bub Framework - BETA
+
+**This is an unstable BETA release.**
 
 This repository contains the Game Bub Framework, which allows writing
 custom cores for [Game Bub](https://gamebub.net/) devices.
