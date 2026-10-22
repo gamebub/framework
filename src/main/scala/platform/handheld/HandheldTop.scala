@@ -427,9 +427,18 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     /** True if the device is docked */
     val docked = Bool()
   }))
+  val controlVideoFilter = RegInit(0.U.asTypeOf(new Bundle {
+    val darken = Bool()
+  }))
 
   val controlCommandHost = RegInit(0.U.asTypeOf(Output(new HostV0.CommandChannel)))
   val controlCommandCore = RegInit(0.U.asTypeOf(Output(new HostV0.CommandChannel)))
+
+  val controlButtonRemap = RegInit(VecInit(
+    Seq.tabulate((new InputV0.Buttons).getWidth)(i =>
+      i.U(log2Ceil(new(InputV0.Buttons).getWidth).W)
+    )
+  ))
 
   /// Synchronized physical button state (without MCU force override)
   val buttonState = Wire(new InputV0.Buttons)
@@ -440,7 +449,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     entries = Seq(
       // Read-only informational registers
       // Framework version
-      0x0000 -> RegisterMap.Entry.r("hB0000001".U),
+      0x0000 -> RegisterMap.Entry.r("hB0000002".U),
       // System clock frequency (Hz)
       0x0004 -> RegisterMap.Entry.r(clockSystemHz.U),
       // Video dimensions
@@ -464,13 +473,30 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
       0x100C -> RegisterMap.Entry.w(controlDock),
       0x1010 -> RegisterMap.Entry.w(controlCoreFocus),
       0x1014 -> RegisterMap.Entry.w(controlVibrate),
+      0x1018 -> RegisterMap.Entry.w(controlVideoFilter),
 
       0x1100 -> RegisterMap.Entry.rw(controlCommandHost),
       0x1104 -> RegisterMap.Entry.rw(controlCommandCore),
 
+      // 0x1200 to 0x12FF: button remap
+
       // Framework status
       0x2000 -> RegisterMap.Entry.r(buttonState),
       0x2004 -> RegisterMap.Entry.r(RegNext(RegNext(io.cartridge.switch))),
+    )
+    ++ Seq.tabulate(controlButtonRemap.length / 4)(i =>
+      (0x1200 + i * 4) -> RegisterMap.Entry(
+        32,
+        read = RegisterMap.ReadFn((_: Bool) => 0.U),
+        write = RegisterMap.WriteFn((write: Bool, data: UInt) =>
+          when (write) {
+            controlButtonRemap(i * 4 + 0) := data(7, 0)
+            controlButtonRemap(i * 4 + 1) := data(15, 8)
+            controlButtonRemap(i * 4 + 2) := data(23, 16)
+            controlButtonRemap(i * 4 + 3) := data(31, 24)
+          }
+        ),
+      ),
     )
   )
 
@@ -523,10 +549,22 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
       controlInterruptPending.buttonEdge := true.B
     }
   }
+
+  // Apply remap registers
+  val remappedButtons = {
+    val n = controlButtonRemap.length
+    val raw = VecInit(buttonState.asUInt.asBools :+ false.B)
+    val remappedVec = VecInit(Seq.tabulate(n) { i =>
+      val source = controlButtonRemap(i)
+      raw(Mux(source < n.U, source, n.U))
+    })
+    remappedVec.asUInt
+  }
+
   // Only pass input through when the core is focused
   val buttonFilter = Module(new ButtonFilter(new InputV0.Buttons))
   buttonFilter.io.enable := controlCoreFocus
-  buttonFilter.io.input := (buttonState.asUInt | controlButtonForce.asUInt).asTypeOf(new InputV0.Buttons)
+  buttonFilter.io.input := (remappedButtons | controlButtonForce.asUInt).asTypeOf(new InputV0.Buttons)
   coreInput := buttonFilter.io.output
 
   val vibrateEnabled = controlCoreFocus && controlVibrate.enable && !controlDock.docked
@@ -612,8 +650,16 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     val framebufferInBounds = Wire(Bool())
     val overlayInBounds = Wire(Bool())
     val videoOutput = ColorRGB(8, 8, 8).make(r = 0, g = 0, b = 0)
+    val darkenVideo = XpmCdcSingle(clock, controlVideoFilter.darken)
     when (framebufferInBounds) {
-      videoOutput := framebufferColor.convertTo(videoOutput)
+      val color = framebufferColor.convertTo(videoOutput)
+      when (darkenVideo) {
+        videoOutput.r := color.r >> 1
+        videoOutput.g := color.g >> 1
+        videoOutput.b := color.b >> 1
+      } .otherwise {
+        videoOutput := color
+      }
     }
     when (overlayRead.a.asBool && overlayInBounds) {
       videoOutput := overlayRead.convertTo(videoOutput)
