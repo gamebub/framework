@@ -4,11 +4,12 @@ import chisel3._
 import chisel3.util._
 import _root_.circt.stage.ChiselStage
 import lib.mem.{MemoryInterface, MemoryMap, RegisterMap}
-import lib.util.{FractionalDivider, ButtonFilter}
+import lib.util.FractionalDivider
 import lib.video.{Color, ColorARGB, ColorRGB}
 import net.gamebub.framework.{Core, CoreException}
 import net.gamebub.framework.interface._
 import platform.handheld.display._
+import platform.handheld.input.HandheldInput
 import platform.handheld.spi.SpiReceiverFifo
 import xilinx.{XpmCdcHandshake, XpmCdcSingle, XpmCdcSyncRst}
 
@@ -146,7 +147,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     val hdmiCy = Input(UInt(10.W))
 
     /** Raw button input, not registered or inverted. */
-    val buttons = Input(new InputV0.Buttons)
+    val buttons = Input(new InputBasicV0.Buttons)
 
     // Cartridge I/O
     val cartridge3V3Enable = Output(Bool())
@@ -162,7 +163,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     val sram = new SramV0(addressWidth = 18, dataWidth = 16)
 
     // SDRAM
-    val sdram = new SdramV0(addressWidth = 13, dataWidth = 16, bankWidth = 2, chips = 1)
+    val sdram = new SdramV0(addressWidth = 13, dataWidth = 16, bankWidth = 2, chips = revision.numSdramChips)
   })
 
   //////////////////////////////////
@@ -296,15 +297,8 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
   }
 
   // Input
-  val coreInput = Wire(new InputV0.Buttons)
-  core.getInterface("input") match {
-    case Some(input: InputV0) => {
-      input.buttons := coreInput
-    }
-    case Some(x) => throw new CoreException("Unknown 'input': " + x.getClass())
-    case None => {}
-  }
-  
+  val input = HandheldInput(core.getInterface("input"))
+
   // Vibrate
   val coreVibrate = Wire(VibrateV0.Mode())
   core.getInterface("vibrate") match {
@@ -379,13 +373,27 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
   core.getInterface("sdram") match {
     case Some(sdram: SdramV0) => {
       assert(sdram.chips <= revision.numSdramChips)
-      io.sdram <> sdram
+      io.sdram.clock := sdram.clock
+      io.sdram.ras := sdram.ras
+      io.sdram.cas := sdram.cas
+      io.sdram.we := sdram.we
+      io.sdram.dqm := sdram.dqm
+      io.sdram.bank := sdram.bank
+      io.sdram.address := sdram.address
+      io.sdram.dataOut := sdram.dataOut
+      io.sdram.dataDir := sdram.dataDir
+      sdram.dataIn := io.sdram.dataIn
+
+      // Unused chips: nCS = 1, CKE = 0
+      val unused = revision.numSdramChips - sdram.chips
+      io.sdram.cs := Cat(Seq.fill(unused)(1.U(1.W)) :+ sdram.cs)
+      io.sdram.cke := Cat(Seq.fill(unused)(0.U(1.W)) :+ sdram.cke)
     }
     case Some(x) => throw new CoreException("Unknown 'sdram': " + x.getClass())
     case None => {
       io.sdram.clock := false.B.asClock
-      io.sdram.cke := false.B
-      io.sdram.cs := true.B
+      io.sdram.cke := 0.U(revision.numSdramChips.W)
+      io.sdram.cs := Fill(revision.numSdramChips, 1.U)
       io.sdram.ras := true.B
       io.sdram.cas := true.B
       io.sdram.we := true.B
@@ -422,26 +430,28 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
   }))
   val controlInterruptEnable = RegInit(0.U.asTypeOf(new HandheldInterrupts))
   val controlInterruptPending = RegInit(0.U.asTypeOf(new HandheldInterrupts))
-  val controlButtonForce = RegInit(0.U.asTypeOf(new InputV0.Buttons))
-  val controlDock = RegInit(0.U.asTypeOf(new Bundle() {
+  val controlDock = RegInit(0.U.asTypeOf(new Bundle {
+    /** Use the built-in screen even when docked */
+    val useInternalScreen = Bool()
     /** True if the device is docked */
     val docked = Bool()
   }))
   val controlVideoFilter = RegInit(0.U.asTypeOf(new Bundle {
     val darken = Bool()
   }))
+  val controlFramebufferLock = RegInit(false.B)
 
   val controlCommandHost = RegInit(0.U.asTypeOf(Output(new HostV0.CommandChannel)))
   val controlCommandCore = RegInit(0.U.asTypeOf(Output(new HostV0.CommandChannel)))
 
   val controlButtonRemap = RegInit(VecInit(
-    Seq.tabulate((new InputV0.Buttons).getWidth)(i =>
-      i.U(log2Ceil(new(InputV0.Buttons).getWidth).W)
+    Seq.tabulate((new InputBasicV0.Buttons).getWidth)(i =>
+      i.U(log2Ceil(new(InputBasicV0.Buttons).getWidth).W)
     )
   ))
 
-  /// Synchronized physical button state (without MCU force override)
-  val buttonState = Wire(new InputV0.Buttons)
+  /// Synchronized physical button state
+  val buttonState = Wire(new InputBasicV0.Buttons)
 
   val registerMap = RegisterMap(
     addressWidth = 16,
@@ -449,13 +459,15 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     entries = Seq(
       // Read-only informational registers
       // Framework version
-      0x0000 -> RegisterMap.Entry.r("hB0000002".U),
+      0x0000 -> RegisterMap.Entry.r("hB0000003".U),
       // System clock frequency (Hz)
       0x0004 -> RegisterMap.Entry.r(clockSystemHz.U),
       // Video dimensions
       0x0100 -> RegisterMap.Entry.r(Cat(videoWidth.U(16.W), videoHeight.U(16.W))),
       // Video color depth
       0x0104 -> RegisterMap.Entry.r(Cat(videoColorDepthR.U(8.W), videoColorDepthG.U(8.W), videoColorDepthB.U(8.W))),
+      // Input capabilities
+      0x0108 -> RegisterMap.Entry.r(input.capabilities.U),
 
       // Framework control
       0x1000 -> RegisterMap.Entry.rw(controlInterruptEnable),
@@ -469,16 +481,17 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
           }
         ),
       ),
-      0x1008 -> RegisterMap.Entry.w(controlButtonForce),
       0x100C -> RegisterMap.Entry.w(controlDock),
       0x1010 -> RegisterMap.Entry.w(controlCoreFocus),
       0x1014 -> RegisterMap.Entry.w(controlVibrate),
       0x1018 -> RegisterMap.Entry.w(controlVideoFilter),
+      0x101C -> RegisterMap.Entry.w(controlFramebufferLock),
 
       0x1100 -> RegisterMap.Entry.rw(controlCommandHost),
       0x1104 -> RegisterMap.Entry.rw(controlCommandCore),
 
       // 0x1200 to 0x12FF: button remap
+      // 0x1400 to 0x143F: input slots
 
       // Framework status
       0x2000 -> RegisterMap.Entry.r(buttonState),
@@ -498,6 +511,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
         ),
       ),
     )
+    ++ input.registerEntries
   )
 
   val overlayInterface = Wire(new MemoryInterface(addressWidth = 18, dataWidth = 16))
@@ -541,7 +555,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
   //////////////////////////////////
   {
     // Invert and synchronize buttons
-    val regButtons = RegNext(RegNext(~io.buttons.asUInt)).asTypeOf(new InputV0.Buttons)
+    val regButtons = RegNext(RegNext(~io.buttons.asUInt)).asTypeOf(new InputBasicV0.Buttons)
     buttonState := regButtons
 
     when (regButtons.asUInt =/= RegNext(regButtons.asUInt)) {
@@ -550,22 +564,18 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     }
   }
 
-  // Apply remap registers
-  val remappedButtons = {
+  // Apply remap registers and drive core input
+  {
     val n = controlButtonRemap.length
     val raw = VecInit(buttonState.asUInt.asBools :+ false.B)
     val remappedVec = VecInit(Seq.tabulate(n) { i =>
       val source = controlButtonRemap(i)
       raw(Mux(source < n.U, source, n.U))
     })
-    remappedVec.asUInt
+    input.handheldButtons := remappedVec.asUInt.asTypeOf(new InputBasicV0.Buttons)
   }
-
-  // Only pass input through when the core is focused
-  val buttonFilter = Module(new ButtonFilter(new InputV0.Buttons))
-  buttonFilter.io.enable := controlCoreFocus
-  buttonFilter.io.input := (remappedButtons | controlButtonForce.asUInt).asTypeOf(new InputV0.Buttons)
-  coreInput := buttonFilter.io.output
+  input.docked := controlDock.docked
+  input.coreFocus := controlCoreFocus
 
   val vibrateEnabled = controlCoreFocus && controlVibrate.enable && !controlDock.docked
   io.vibrate := RegNext(coreVibrate === VibrateV0.Mode.On && vibrateEnabled)
@@ -573,7 +583,8 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
   //////////////////////////////////
   // Video
   //////////////////////////////////
-  io.hdmiEnable := controlDock.docked
+  val hdmiActive = controlDock.docked && !controlDock.useInternalScreen
+  io.hdmiEnable := hdmiActive
 
   // Double buffering
   val framebuffers = (0 until 2).map(_ =>
@@ -596,7 +607,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
   // Keep HDMI MMCM powered for a few more cycles after switching away
   // from it to ensure the clock mux functions correctly.
   val hdmiClockPowerTimer = RegInit(0.U(3.W))
-  when (controlDock.docked) {
+  when (hdmiActive) {
     hdmiClockPowerTimer := 7.U
   } .elsewhen (hdmiClockPowerTimer > 0.U) {
     hdmiClockPowerTimer := hdmiClockPowerTimer - 1.U
@@ -604,6 +615,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
   io.hdmiClockPowerDown := hdmiClockPowerTimer === 0.U
 
   val reset_av = withClock(io.clock_av) { XpmCdcSyncRst(reset) }
+  val displayReadingFrame = Wire(UInt(1.W))
   withClockAndReset (clock = io.clock_av, reset = reset_av) {
     val videoX = Wire(UInt(10.W))
     val videoY = Wire(UInt(10.W))
@@ -617,6 +629,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     //
     // Read from the correct framebuffer.
     val framebufferIndex = Wire(UInt(1.W))
+    displayReadingFrame := framebufferIndex
     val lastFrameComplete = XpmCdcSingle(clock, regLastFrameComplete.asBool).asUInt
     for (i <- 0 until 2) {
       framebuffers(i).readPorts(0).enable := framebufferIndex === i.U
@@ -694,7 +707,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     io.hdmiRgb := videoOutput.convertTo(ColorRGB(8, 8, 8)).asUInt
     val regHdmiFrame = RegInit(0.U(1.W))
 
-    val hdmiEnable = XpmCdcSingle(clock, controlDock.docked)
+    val hdmiEnable = XpmCdcSingle(clock, hdmiActive)
     when (hdmiEnable) {
       dpiDriver.reset := true.B
       val screenWidth = 720
@@ -894,31 +907,53 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
 
   // Framebuffer writes
   {
+    val activeDisplayFrame = XpmCdcSingle(io.clock_av, displayReadingFrame.asBool).asUInt
     val framebufferX = RegInit(0.U(log2Ceil(videoWidth).W))
     val framebufferY = RegInit(0.U(log2Ceil(videoHeight).W))
-    val framebufferWriteIndex = RegInit(0.U(1.W))
+    val framebufferWriteIndex = RegInit(1.U(1.W))
+    val regFrameStarted = RegInit(false.B)
+    val regDropFrame = RegInit(false.B)
 
-    when (coreVideo.dataEnable && !framebufferInterfaceRead) {
-      // Core framebuffer write and SPI framebuffer read share the same read/write port,
-      // so ensure that they're not activated at the same time (so they can be inferred correctly).
-      val address = (framebufferY * videoWidth.U(10.W)) + framebufferX
-      val data = Wire(ColorRGB(videoColorDepthR, videoColorDepthG, videoColorDepthB))
-      data.r := coreVideo.dataR
-      data.g := coreVideo.dataG
-      data.b := coreVideo.dataB
-      for (i <- 0 until 2) {
-        framebuffers(i).readwritePorts(0).enable := (i.U === framebufferWriteIndex)
+    val vblankEdge = coreVideo.vblank && !RegNext(coreVideo.vblank)
+    val hblankEdge = coreVideo.hblank && !RegNext(coreVideo.hblank)
+
+    // If the core starts writing a frame while a rotated internal display is actively
+    // reading the same buffer, drop the *entire* frame to prevent diagonal tearing.
+    //
+    // However, skip this on HDMI (unrotated, free-running) and non-rotated displays
+    // (well, specifically the Rev 3 display) which cannot pause/resync in vblank.
+    //
+    // Latch the decision to drop on the first active pixel so that cores with
+    // a very short vblank period still allow the display driver to switch buffers.
+    val frameConflict = revision.displayRotate.B && !hdmiActive &&
+      (framebufferWriteIndex === activeDisplayFrame)
+    val dropFrame = Mux(!regFrameStarted, frameConflict, regDropFrame)
+    when (!coreVideo.vblank && coreVideo.dataEnable && !regFrameStarted) {
+      regFrameStarted := true.B
+      regDropFrame := frameConflict
+    }
+
+    val address = (framebufferY * videoWidth.U(10.W)) + framebufferX
+    val data = Wire(ColorRGB(videoColorDepthR, videoColorDepthG, videoColorDepthB))
+    data.r := coreVideo.dataR
+    data.g := coreVideo.dataG
+    data.b := coreVideo.dataB
+    for (i <- 0 until 2) {
+      when (coreVideo.dataEnable && i.U === framebufferWriteIndex && !dropFrame) {
+        framebuffers(i).readwritePorts(0).enable := true.B
         framebuffers(i).readwritePorts(0).address := address
         framebuffers(i).readwritePorts(0).isWrite := true.B
         framebuffers(i).readwritePorts(0).writeData := data.asUInt
       }
     }
 
-    val vblankEdge = coreVideo.vblank && !RegNext(coreVideo.vblank)
-    val hblankEdge = coreVideo.hblank && !RegNext(coreVideo.hblank)
     when (vblankEdge) {
-      regLastFrameComplete := framebufferWriteIndex
-      framebufferWriteIndex := !framebufferWriteIndex
+      when (!controlFramebufferLock && !regDropFrame) {
+        regLastFrameComplete := framebufferWriteIndex
+        framebufferWriteIndex := !framebufferWriteIndex
+      }
+      regFrameStarted := false.B
+      regDropFrame := false.B
     }
 
     when (coreVideo.vblank) {
@@ -949,6 +984,12 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
   coreCommandCore.busy := controlCommandCore.busy
   coreCommandCore.done := controlCommandCore.done
   coreCommandCore.error := controlCommandCore.error
+
+  when (!coreCommandCore.request) {
+    controlCommandCore.busy := false.B
+    controlCommandCore.done := false.B
+    controlCommandCore.error := false.B
+  }
 }
 
 case class Revision(
